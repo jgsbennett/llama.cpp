@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import pytest
 from utils import *
 
@@ -87,6 +88,163 @@ def test_clear_and_restore():
     })
     assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+
+
+# a failed restore under cell pressure parks idle siblings and retries once
+@pytest.mark.parametrize("n_slots,n_ctx,cache_ram,n_tokens_a,n_tokens_b", [
+    (2, 256, 100, 180, 150),
+    (3, 256, 100, 180, 150),
+    # Both prompts fit in KV, but their states do not fit together in RAM.
+    (2, 2048, 1, 1200, 700),
+])
+def test_restore_retry_after_parking(n_slots, n_ctx, cache_ram, n_tokens_a, n_tokens_b):
+    global server
+    server.n_slots = n_slots
+    server.n_ctx = n_ctx
+    server.cache_ram = cache_ram
+    server.override_kv = f"llama.context_length=int:{n_ctx}"
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = server.make_request("POST", "/tokenize", data={"content": "Hello world"})
+    assert res.status_code == 200
+    tokens = res.body["tokens"]
+    prompt_a = [tokens[0]] * n_tokens_a
+    prompt_b = [tokens[-1]] * n_tokens_b
+
+    for prompt, n_cached in [
+        (prompt_a, 0),
+        (prompt_a + [tokens[0]] * 10, n_tokens_a),
+        (prompt_b, 0),
+        (prompt_a + [tokens[0]] * 20, n_tokens_a + 10),
+        (prompt_b + [tokens[-1]] * 10, n_tokens_b),
+        (prompt_a + [tokens[0]] * 30, n_tokens_a + 20),
+    ]:
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "n_predict": 1,
+            "cache_prompt": True,
+        })
+        assert res.status_code == 200
+        assert res.body["timings"]["cache_n"] >= n_cached
+        assert res.body["timings"]["prompt_n"] <= len(prompt) - n_cached
+
+    # the 256-token pool is tight enough to force a failed restore with parking
+    if n_ctx == 256:
+        content = log.drain()
+        assert "retrying prompt restore after parking" in content
+        assert "__TEST_TAG_CACHE_IDLE_SLOT__" in content
+
+
+# the parked state carries generated tokens, so restoring it needs cells for
+# the full state, not just for the returning prompt
+def test_restore_state_larger_than_prompt():
+    global server
+    server.n_ctx = 256
+    server.override_kv = "llama.context_length=int:256"
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = server.make_request("POST", "/tokenize", data={"content": "Hello world"})
+    assert res.status_code == 200
+    tokens = res.body["tokens"]
+    prompt_a = [tokens[0]] * 250
+    prompt_b = [tokens[-1]] * 10
+
+    # park a state that extends past its own prompt
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt_a,
+        "n_predict": 2,
+        "ignore_eos": True,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # launching b parks prompt_a's state, and b keeps its cells after completing
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt_b,
+        "n_predict": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    # at most 245 cells are free while b's state is resident, and the parked
+    # state needs 252 - the idle sibling has to be parked to make room
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt_a + [tokens[0]] * 2,
+        "n_predict": 2,
+        "ignore_eos": True,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    content = log.drain()
+    assert "retrying prompt restore after parking" in content
+    assert res.body["timings"]["cache_n"] >= len(prompt_a)
+    assert res.body["timings"]["prompt_n"] <= 2
+
+
+# all sibling cells are held by an active decode, so the restore defers until
+# the sibling releases its slot
+def test_defer_restore_until_cells_free():
+    global server
+    server.n_ctx = 256
+    server.override_kv = "llama.context_length=int:256"
+    # single-threaded decode plus a long b stream keep b decoding long
+    # enough that a's restore attempt lands while b is still decoding
+    server.n_threads = 1
+    server.start()
+    log = LogReader(server.log_path)
+
+    res = server.make_request("POST", "/tokenize", data={"content": "Hello world"})
+    assert res.status_code == 200
+    tokens = res.body["tokens"]
+    prompt_a = [tokens[0]] * 220
+    prompt_b = [tokens[-1]] * 40
+
+    # park a state that cannot fit next to b under any decode progress
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt_a,
+        "n_predict": 2,
+        "ignore_eos": True,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+
+    stream_first = threading.Event()
+    stream_done = threading.Event()
+
+    def run_stream():
+        try:
+            for _ in server.make_stream_request("POST", "/completion", data={
+                "prompt": prompt_b,
+                "n_predict": 160,
+                "ignore_eos": True,
+                "cache_prompt": True,
+                "stream": True,
+            }):
+                stream_first.set()
+        finally:
+            stream_done.set()
+
+    threading.Thread(target=run_stream).start()
+    assert stream_first.wait(30)
+
+    # at most 215 cells are free while b decodes (256 - b's resident cells),
+    # and the parked state needs 222 - the restore defers until b releases
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt_a + [tokens[0]] * 2,
+        "n_predict": 2,
+        "ignore_eos": True,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert stream_done.wait(5)
+
+    content = log.drain()
+    assert "no idle slot to park after failed prompt restore, deferring task" in content
+    assert "retrying prompt restore after parking" in content
+    assert res.body["timings"]["cache_n"] >= len(prompt_a)
+    assert res.body["timings"]["prompt_n"] <= 2
 
 
 def test_disabled_with_flag():

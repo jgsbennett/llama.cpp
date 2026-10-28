@@ -1880,9 +1880,6 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 return false;
             }
-
-            data.clear();
-            data.shrink_to_fit();
         }
 
         {
@@ -1898,12 +1895,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
             }
         }
 
+        // buffers are kept intact so a failed restore can be retried - the entry is consumed only on success
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);

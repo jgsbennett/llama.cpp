@@ -1799,6 +1799,8 @@ private:
 
         bool update_cache = false;
 
+        bool defer_task = false;
+
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1892,6 +1894,28 @@ private:
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
+
+                    // restore can only fail under unified-kv cell pressure:
+                    // park idle slots to free cells and retry once, defer if it still fails
+                    if (params_base.kv_unified && params_base.cache_idle_slots) {
+                        const int n_parked = cache_idle_slots(ret->id);
+
+                        if (n_parked > 0) {
+                            SLT_INF(*ret, "retrying prompt restore after parking %d idle slot(s)\n", n_parked);
+
+                            if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                                ret->prompt_clear();
+
+                                SLT_WRN(*ret, "prompt restore still failed after parking %d idle slot(s), deferring task\n", n_parked);
+
+                                defer_task = true;
+                            }
+                        } else {
+                            SLT_WRN(*ret, "%s", "no idle slot to park after failed prompt restore, deferring task\n");
+
+                            defer_task = true;
+                        }
+                    }
                 }
 
                 prompt_cache->update();
@@ -1900,7 +1924,8 @@ private:
             }
         }
 
-        return ret;
+        // nullptr defers the task - it is popped again on the next slot release, restoring then
+        return defer_task ? nullptr : ret;
     }
 
     // return true if at least one slot has been cleared
@@ -1933,6 +1958,37 @@ private:
         }
 
         return res;
+    }
+
+    // state-preserving make-room: save idle slots to the prompt cache, then clear their cells
+    // unlike try_clear_idle_slots, no state is lost and the target slot is kept untouched
+    int cache_idle_slots(int id_slot_keep) {
+        int n_parked = 0;
+
+        if (!params_base.cache_idle_slots) {
+            return n_parked;
+        }
+
+        for (auto & slot : slots) {
+            if (slot.is_processing() || slot.id == id_slot_keep) {
+                continue;
+            }
+
+            SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+
+            // clear only after a successful save - never destroy a state
+            if (slot.prompt_save(*prompt_cache)) {
+                prompt_cache->update();
+
+                if (params_base.kv_unified) {
+                    slot.prompt_clear();
+
+                    n_parked++;
+                }
+            }
+        }
+
+        return n_parked;
     }
 
     std::vector<common_adapter_lora_info> construct_lora_list(const std::map<int, float> & config) const {
