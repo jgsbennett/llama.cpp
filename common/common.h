@@ -454,6 +454,14 @@ struct lr_opt {
 
 struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
+// what to do when a decode step runs out of unified KV cache cells
+enum common_decode_overflow_policy {
+    COMMON_DECODE_OVERFLOW_POLICY_OFF,          // fail all decoding sessions (default)
+    COMMON_DECODE_OVERFLOW_POLICY_NEWEST,       // park the newest processing session
+    COMMON_DECODE_OVERFLOW_POLICY_LARGEST,      // park the session with the largest KV extent
+    COMMON_DECODE_OVERFLOW_POLICY_LEAST_OUTPUT, // park the least-progressed session
+};
+
 struct common_params {
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
@@ -643,6 +651,8 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
+    enum common_decode_overflow_policy decode_overflow_policy = COMMON_DECODE_OVERFLOW_POLICY_OFF; // park a session on decode KV exhaustion instead of failing all
+    int32_t decode_overflow_reserve = -1; // requeue reserve under --decode-overflow-policy; -1 = default of 1 token for requeued sessions only
 
     // llama-connect params
     bool        server_connect      = false;

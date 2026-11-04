@@ -119,6 +119,8 @@ class ServerProcess:
     cache_ram: int | None = None
     override_kv: str | None = None
     no_cache_idle_slots: bool = False
+    decode_overflow_policy: str | None = None
+    decode_overflow_reserve: int | None = None
     log_path: str | None = None
     ui_mcp_proxy: bool = False
     backend_sampling: bool = False
@@ -297,6 +299,10 @@ class ServerProcess:
             server_args.extend(["--override-kv", self.override_kv])
         if self.no_cache_idle_slots:
             server_args.append("--no-cache-idle-slots")
+        if self.decode_overflow_policy is not None:
+            server_args.extend(["--decode-overflow-policy", self.decode_overflow_policy])
+        if self.decode_overflow_reserve is not None:
+            server_args.extend(["--decode-overflow-reserve", self.decode_overflow_reserve])
         if self.ui_mcp_proxy:
             server_args.append("--ui-mcp-proxy")
         if self.server_tools:
@@ -431,6 +437,7 @@ class ServerProcess:
         data: dict | None = None,
         headers: dict | None = None,
         host: str | None = None,
+        on_response: Callable | None = None,
     ) -> Iterator[dict]:
         url = self.make_url(path, host)
         if method == "POST":
@@ -439,6 +446,11 @@ class ServerProcess:
             raise ValueError(f"Unimplemented method: {method}")
         if response.status_code != 200:
             raise ServerError(response.status_code, response.json())
+        # expose the raw response so a reader can close it mid-stream - the
+        # server sees the disconnect, cancels the task and releases its slot
+        # with the state still resident (an idle slot a sweep can free)
+        if on_response is not None:
+            on_response(response)
         for line_bytes in response.iter_lines():
             line = line_bytes.decode("utf-8")
             if '[DONE]' in line:

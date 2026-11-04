@@ -1688,6 +1688,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--decode-overflow-policy"}, "POLICY",
+        "when a decode step runs out of unified KV cache cells, park the selected session (restorable from the prompt cache) and continue the others instead of failing all of them; choices: off, newest, largest, least-output (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.decode_overflow_policy = COMMON_DECODE_OVERFLOW_POLICY_OFF;
+            } else if (value == "newest") {
+                params.decode_overflow_policy = COMMON_DECODE_OVERFLOW_POLICY_NEWEST;
+            } else if (value == "largest") {
+                params.decode_overflow_policy = COMMON_DECODE_OVERFLOW_POLICY_LARGEST;
+            } else if (value == "least-output") {
+                params.decode_overflow_policy = COMMON_DECODE_OVERFLOW_POLICY_LEAST_OUTPUT;
+            } else {
+                throw std::runtime_error(string_format("error: unknown value for --decode-overflow-policy: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_DECODE_OVERFLOW_POLICY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--decode-overflow-reserve"}, "N",
+        "when --decode-overflow-policy is active, do not start or requeue a session unless more than this many tokens would remain free in the unified KV cache beyond its placement; applies to incoming requests and to requeued parked sessions (-1 = default of 1, applied to requeued parked sessions only)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("decode-overflow-reserve must be -1 (default) or non-negative");
+            }
+            params.decode_overflow_reserve = value;
+        }
+    ).set_env("LLAMA_ARG_DECODE_OVERFLOW_RESERVE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

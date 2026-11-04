@@ -340,7 +340,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, bool * already_cached = nullptr) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -353,7 +353,7 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, already_cached);
         if (cur == nullptr) {
             return false;
         }
@@ -1111,6 +1111,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // task ids parked by the decode-overflow policy, waiting to requeue
+    std::set<int> parked_task_ids;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1676,6 +1679,18 @@ private:
             }
         }
 
+        // the policy parks through the prompt cache
+        if (params_base.decode_overflow_policy != COMMON_DECODE_OVERFLOW_POLICY_OFF && params_base.cache_ram_mib == 0) {
+            SRV_WRN("%s", "--decode-overflow-policy requires --cache-ram, disabling\n");
+            params_base.decode_overflow_policy = COMMON_DECODE_OVERFLOW_POLICY_OFF;
+        }
+
+        // the policy parks through a unified KV pool
+        if (params_base.decode_overflow_policy != COMMON_DECODE_OVERFLOW_POLICY_OFF && !params_base.kv_unified) {
+            SRV_WRN("%s", "--decode-overflow-policy requires --kv-unified, disabling\n");
+            params_base.decode_overflow_policy = COMMON_DECODE_OVERFLOW_POLICY_OFF;
+        }
+
         {
             const std::string & cfg = params_base.ui_config_json;
             if (!cfg.empty()) {
@@ -1794,10 +1809,72 @@ private:
         return nullptr;
     }
 
+    // free cells of the unified KV pool, derived from the slots' resident extents
+    int64_t n_ctx_free() const {
+        int64_t n_used = 0;
+        for (const auto & slot : slots) {
+            n_used += (int64_t) slot.prompt.tokens.size_up_to_pos(
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1);
+        }
+        return (int64_t) n_ctx - n_used;
+    }
+
+    bool all_slots_idle() const {
+        for (const auto & slot : slots) {
+            if (slot.is_processing()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // under the decode-overflow policy, hold back a session whose placement
+    // would leave the unified pool without the reserve
+    bool decode_overflow_blocks(const server_task & task) const {
+        const bool has_reserve_override = params_base.decode_overflow_reserve != -1;
+        if (!params_base.kv_unified ||
+                params_base.decode_overflow_policy == COMMON_DECODE_OVERFLOW_POLICY_OFF ||
+                (!has_reserve_override && !parked_task_ids.count(task.id))) {
+            return false;
+        }
+
+        const int32_t n_reserve = has_reserve_override ? params_base.decode_overflow_reserve : 1;
+        return n_ctx_free() - (int64_t) task.tokens.size() <= n_reserve;
+    }
+
+    // save the resident states of the idle slots into the prompt cache and
+    // return their cells to the unified pool
+    void sweep_idle_slots() {
+        if (!params_base.cache_idle_slots) {
+            return;
+        }
+
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+
+                if (slot.prompt_save(*prompt_cache)) {
+                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                    prompt_cache->update();
+                }
+
+                if (params_base.kv_unified) {
+                    // [TAG_IDLE_SLOT_CLEAR]
+                    slot.prompt_clear();
+                }
+            }
+        }
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+
+        if (decode_overflow_blocks(task)) {
+            return nullptr;
+        }
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1809,6 +1886,12 @@ private:
                 }
 
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
+
+                // a requeued parked session targets its own slot, which the
+                // park left empty: force the update to load its saved state
+                if (parked_task_ids.count(task.id) && ret->prompt.tokens.empty()) {
+                    update_cache = true;
+                }
             }
         }
 
@@ -2055,7 +2138,14 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                if (task.carried_sampler) {
+                    // a resumed park adopts the sampler cloned at the park:
+                    // its grammar, budget, history and RNG state match the
+                    // restored prompt exactly
+                    slot.smpl = std::move(task.carried_sampler);
+                } else {
+                    slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                }
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -2345,6 +2435,39 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // fold the pre-park segments into the stats copy sent to the client, so a
+    // resumed session reports exactly like an uninterrupted one, except that
+    // the re-evaluated park tails stay out of the prompt work: the client
+    // caused P_fresh fresh prefill tokens, so prompt_n reports exactly that
+    // (plus any genuine cache-miss re-prefill a resume might have had - the
+    // park path has none) and prompt_n + cache_n == the client's prompt
+    // length holds under parking (a park that appended no tail resumes fully
+    // cached and the forced re-evaluation of its last token adds exactly one,
+    // so prompt_n reads P_fresh + 1 there)
+    static void stats_apply_park_carry(server_slot_stats & stats, const struct server_task::park_output & pre) {
+        // the gap between the last park and this resume; every earlier gap
+        // was folded into the carry at its next park
+        const int64_t t_park_wait_us = stats.t_start - pre.t_gen_last;
+
+        // a resumed segment whose only prompt work was its handed tail (or,
+        // on a fully cached resume, the forced single-token re-evaluation)
+        // adds no prompt window of its own - like the carry, it is park
+        // machinery rather than client-caused prefill: its window already
+        // sits inside the reported prompt span, so the term below enters the
+        // t_start rewind negated to cut it back out of prompt_ms
+        const int64_t t_prompt_seg_us = pre.has_been_parked && stats.n_prompt_processed == 1
+            ? stats.t_prompt_last - stats.t_start : 0;
+
+        stats.n_prompt_cached      = pre.n_prompt_cached_orig;
+        stats.n_prompt_processed  += pre.n_prompt_processed - (uint64_t) pre.n_prompt_tail;
+        stats.n_gen               += (uint64_t) pre.n_gen;
+        stats.n_draft_tokens      += pre.n_draft_tokens;
+        stats.n_draft_accepted    += pre.n_draft_accepted;
+        stats.n_draft_verif_steps += pre.n_draft_verif_steps;
+        stats.t_start             -= pre.t_gen_us + t_park_wait_us + pre.t_prompt_us - t_prompt_seg_us;
+        stats.t_prompt_last       -= pre.t_gen_us + t_park_wait_us;
+    }
+
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
@@ -2365,9 +2488,17 @@ private:
             res->tokens.assign(1, tkn.tok);
         }
 
-        res->n_decoded             = slot.stats.n_gen;
-        res->n_prompt_tokens       = slot.task->n_tokens();
-        res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
+        // a resumed parked task keeps reporting the running delivered total
+        // (a restart would re-fire the n_decoded == 1 protocol chunks)
+        const auto & pre = slot.task->park_output;
+        const int32_t n_gen_parked = (!is_begin && !is_progress)
+                ? (int32_t) pre.n_gen : 0;
+
+        res->n_decoded             = slot.stats.n_gen + n_gen_parked;
+        // a parked session reports the prompt the client sent, not the
+        // extended sequence it internally continues from
+        res->n_prompt_tokens       = pre.n_prompt_orig ? pre.n_prompt_orig : slot.task->n_tokens();
+        res->n_prompt_tokens_cache = pre.n_prompt_orig ? pre.n_prompt_cached_orig : slot.stats.n_prompt_cached;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
         res->verbose           = slot.task->params.verbose;
@@ -2383,6 +2514,9 @@ private:
         // populate timings if this is final response or timings_per_token is enabled
         if (slot.stop != STOP_TYPE_NONE || slot.task->params.timings_per_token) {
             res->stats = slot.stats;
+            if (n_gen_parked > 0) {
+                stats_apply_park_carry(res->stats, pre);
+            }
         }
 
         queue_results.send(std::move(res));
@@ -2421,14 +2555,30 @@ private:
             res->content     = std::move(slot.generated);
             res->tokens      = std::move(slot.generated_tokens);
         }
+        // a parked task resumes with the pre-park output restored into the
+        // slot; the slot stats count only the post-resume segment
+        const int32_t n_gen_parked = (int32_t) slot.task->park_output.n_gen;
+        const auto & pre = slot.task->park_output;
+
         res->stats           = slot.stats;
-        res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
+        if (n_gen_parked > 0) {
+            stats_apply_park_carry(res->stats, pre);
+        }
+        if (pre.n_prompt_orig) {
+            // echo the prompt the client sent, not the extended sequence
+            // the session internally continues from
+            server_tokens prompt_orig = slot.task->tokens.clone();
+            prompt_orig.keep_first((size_t) pre.n_prompt_orig);
+            res->prompt = prompt_orig.detokenize(ctx_tgt, true);
+        } else {
+            res->prompt = slot.task->tokens.detokenize(ctx_tgt, true);
+        }
         res->response_fields = std::move(slot.task->params.response_fields);
 
         res->truncated             = slot.truncated;
-        res->n_decoded             = slot.stats.n_gen;
-        res->n_prompt_tokens       = slot.task->n_tokens();
-        res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
+        res->n_decoded             = slot.stats.n_gen + n_gen_parked;
+        res->n_prompt_tokens       = pre.n_prompt_orig ? pre.n_prompt_orig : slot.task->n_tokens();
+        res->n_prompt_tokens_cache = pre.n_prompt_orig ? pre.n_prompt_cached_orig : slot.stats.n_prompt_cached;
         res->n_tokens_cached       = slot.prompt.n_tokens();
         res->has_new_line          = slot.has_new_line;
         res->stopping_word         = slot.stopping_word;
@@ -2459,6 +2609,11 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+        if (pre.n_prompt_orig) {
+            // report the budget as requested; the park-reduced remainder is
+            // engine-internal (a sentinel like -1 passes through untouched)
+            res->generation_params.n_predict = pre.n_predict_orig;
+        }
 
         queue_results.send(std::move(res));
     }
@@ -3037,10 +3192,32 @@ private:
                     //
 
                     if (slot == nullptr) {
-                        // if no slot is available, we defer this task for processing later
-                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
-                        queue_tasks.defer(std::move(task));
-                        break;
+                        // an all-idle server is blocked only by idle states, which
+                        // the sweep frees - fail loudly if even that cannot make room
+                        if (decode_overflow_blocks(task) && all_slots_idle()) {
+                            sweep_idle_slots();
+
+                            slot = get_available_slot(task);
+
+                            if (slot == nullptr) {
+                                const int32_t n_reserve = params_base.decode_overflow_reserve != -1
+                                    ? params_base.decode_overflow_reserve : 1;
+
+                                SRV_WRN("task id = %d, decode-overflow policy: no room even after clearing idle slots, failing the task\n", id_task);
+                                send_error(task, string_format("the decode-overflow reserve cannot be met: even with all idle slots cleared, the unified KV cache (%d cells) cannot hold this session (%d tokens) plus the reserve (%d)",
+                                        (int) n_ctx, (int) task.tokens.size(), (int) n_reserve), ERROR_TYPE_SERVER);
+                                // a parked task failing here still holds its requeue gate entry
+                                if (parked_task_ids.erase(task.id)) {
+                                    SRV_DBG("%s", "__TEST_TAG_DECODE_OVERFLOW_PARK_FAILED__\n");
+                                }
+                                break; // drop the task
+                            }
+                        } else {
+                            // if no slot is available, we defer this task for processing later
+                            SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
                     }
 
                     if (slot->is_processing()) {
@@ -3049,6 +3226,9 @@ private:
                         queue_tasks.defer(std::move(task));
                         break;
                     }
+
+                    // the task launches now - release it from the park gate
+                    parked_task_ids.erase(task.id);
 
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
@@ -3068,23 +3248,7 @@ private:
                         break; // drop the task
                     }
 
-                    if (params_base.cache_idle_slots) {
-                        for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
-                                }
-
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
-                                }
-                            }
-                        }
-                    }
+                    sweep_idle_slots();
                 } break;
             case SERVER_TASK_TYPE_CANCEL:
                 {
@@ -3094,6 +3258,10 @@ private:
                             slot.release();
                             break;
                         }
+                    }
+                    // a parked task is not on a slot - release its requeue gate entry too
+                    if (parked_task_ids.erase(task.id_target)) {
+                        SRV_DBG("%s", "__TEST_TAG_DECODE_OVERFLOW_PARK_CANCELLED__\n");
                     }
                 } break;
             case SERVER_TASK_TYPE_CONTROL:
@@ -4327,7 +4495,9 @@ private:
                         slot.prompt.tokens.keep_first(n_past);
 
                         // this is to signal the client that the request has started processing
-                        if (slot.task->params.stream) {
+                        // (skipped for a resumed parked stream: its begin partial was
+                        // already sent as the first result of the original launch)
+                        if (slot.task->params.stream && !slot.task->park_output.has_been_parked) {
                             if (slot.task->params.return_progress) {
                                 // send initial 0% progress update if needed
                                 send_partial_response(slot, {}, true);
@@ -4551,6 +4721,19 @@ private:
                         batch.set_output(batch.size() - 1, true);
 
                         slot.stats.n_gen = 0;
+
+                        // a resumed parked task continues its pre-park output
+                        // instead of restarting from empty
+                        if (slot.task->park_output.n_gen > 0) {
+                            slot.generated             = slot.task->park_output.generated;
+                            slot.generated_tokens      = slot.task->park_output.generated_tokens;
+                            slot.generated_token_probs = slot.task->park_output.generated_token_probs;
+                            slot.n_sent_text           = slot.task->park_output.n_sent_text;
+                            slot.last_nl_pos           = slot.task->park_output.last_nl_pos;
+                            slot.has_new_line          = slot.task->park_output.has_new_line;
+                            slot.truncated             = slot.task->park_output.truncated;
+                        }
+
                         slot.i_batch     = batch.size() - 1;
 
                         slot.init_sampler();
@@ -4653,6 +4836,256 @@ private:
         return true;
     }
 
+    // can this slot be parked to free its cells when decode runs out of them
+    bool can_park_on_overflow(const server_slot & slot) const {
+        if (slot.state != SLOT_STATE_GENERATING || !slot.task || prompt_cache == nullptr) {
+            return false;
+        }
+
+        if (slot.task->is_child() || slot.task->is_stateless()) {
+            return false;
+        }
+
+        // the park path captures the tail as plain tokens - a multimodal
+        // prompt must ride the stock path instead
+        if (slot.prompt.tokens.has_mtmd) {
+            return false;
+        }
+
+        // never split a session from its active children
+        for (const auto & other : slots) {
+            if (other.task && other.task->id_parent == slot.task->id) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // pick the session to park per --decode-overflow-policy; ties are broken
+    // by the larger KV extent, then by the older task
+    server_slot * get_overflow_victim() {
+        int n_processing = 0;
+        for (const auto & slot : slots) {
+            n_processing += slot.is_processing();
+        }
+
+        // parking must leave at least one other session running
+        if (n_processing < 2) {
+            return nullptr;
+        }
+
+        server_slot * victim        = nullptr;
+        size_t       victim_extent  = 0;
+        int64_t      victim_metric  = 0;
+
+        for (auto & slot : slots) {
+            if (!can_park_on_overflow(slot)) {
+                continue;
+            }
+
+            const size_t extent = slot.prompt.tokens.size_up_to_pos(
+                    llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1);
+
+            int64_t metric;
+            switch (params_base.decode_overflow_policy) {
+                case COMMON_DECODE_OVERFLOW_POLICY_LARGEST:
+                    metric = (int64_t) extent;
+                    break;
+                case COMMON_DECODE_OVERFLOW_POLICY_LEAST_OUTPUT:
+                    metric = -(int64_t) slot.stats.n_gen;
+                    break;
+                default: // newest
+                    metric = slot.task->id;
+                    break;
+            }
+
+            const bool better = victim == nullptr ||
+                metric > victim_metric ||
+                (metric == victim_metric && (extent > victim_extent ||
+                    (extent == victim_extent && slot.task->id < victim->task->id)));
+
+            if (better) {
+                victim        = &slot;
+                victim_extent = extent;
+                victim_metric = metric;
+            }
+        }
+
+        return victim;
+    }
+
+    // remove the parked slot's entries at or after off from the shared batch
+    // and shift the other slots' indices, so the retried chunk stays coherent
+    void prune_batch_after_park(server_batch & batch, const server_slot & victim, int32_t off) {
+        std::vector<int32_t> new_idx;
+        new_idx.reserve(batch.tokens.size());
+
+        int32_t n_new = 0;
+        for (int32_t i = 0; i < (int32_t) batch.tokens.size(); i++) {
+            // entries below off are already processed - keeping them in place
+            // keeps the retry window aligned with the unprocessed tokens
+            new_idx.push_back(i >= off && batch.tokens[i].id_slot == victim.id ? -1 : n_new++);
+        }
+
+        for (auto & slot : slots) {
+            if (slot.i_batch >= 0 && slot.i_batch < (int32_t) new_idx.size() &&
+                    batch.tokens[slot.i_batch].id_slot == slot.id) {
+                slot.i_batch = new_idx[slot.i_batch];
+            }
+            for (auto & i : slot.spec_i_batch) {
+                if (i >= 0 && i < (int32_t) new_idx.size() && batch.tokens[i].id_slot == slot.id) {
+                    i = new_idx[i];
+                }
+            }
+        }
+
+        int32_t j = 0;
+        for (int32_t i = 0; i < (int32_t) new_idx.size(); i++) {
+            if (new_idx[i] >= 0) {
+                batch.tokens[j++] = batch.tokens[i];
+            }
+        }
+        batch.tokens.resize(j);
+    }
+
+    // park a session at a decode-failure boundary: roll back its unprocessed
+    // tokens, save the state and requeue it to resume from the cache later
+    bool park_on_overflow(server_slot & slot, server_batch & batch, int32_t off) {
+        const size_t extent = slot.prompt.tokens.size_up_to_pos(
+                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id) + 1);
+        const size_t n_tail = slot.prompt.tokens.size() - extent;
+
+        // the tail can only be the failed chunk (the sampled token and the
+        // draft) - anything else is unexpected, fall back to the stock path
+        if (n_tail > 1 + slot.spec_draft.size()) {
+            SLT_WRN(slot, "unexpected tail of %zu tokens, skipping park\n", n_tail);
+            return false;
+        }
+
+        // capture the tail to restore the slot if saving the state fails
+        llama_tokens tail;
+        {
+            const auto & tokens = slot.prompt.tokens.get_tokens();
+            tail.assign(tokens.end() - n_tail, tokens.end());
+        }
+
+        // drop the tail so prompt.tokens matches the KV extent again
+        slot.prompt.tokens.keep_first(extent);
+        slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+
+        // the state may already be fully cached (e.g. by an earlier park of
+        // the same session) - skipping the save is not a failure
+        bool already_cached = false;
+        if (!slot.prompt_save(*prompt_cache, &already_cached) && !already_cached) {
+            slot.prompt.tokens.insert(tail); // keep the session intact
+            return false;
+        }
+
+        prompt_cache->update();
+
+        // the resumed session continues from the saved extent, so it only
+        // generates what is left of its limit
+        server_task task;
+        task.id      = slot.task->id;
+        task.index   = slot.task->index;
+        // target the task at its own slot, so the deferred pop resumes it
+        // there instead of popping an unrelated deferred task
+        task.id_slot = slot.id;
+        task.type    = slot.task->type;
+        task.params  = slot.task->params;
+        if (task.params.n_predict != -1) {
+            task.params.n_predict -= (int32_t) slot.stats.n_gen;
+        }
+
+        // the live sampler is cloned so the resume continues from the exact
+        // pre-park state: the relaunch path's re-initialized sampler replays
+        // the prompt without advancing the grammar or budget parse state,
+        // while the carried state already matches task.tokens 1:1 (the tail's
+        // leading token was accepted before the park and the pending draft
+        // was never accepted)
+        if (slot.smpl) {
+            task.carried_sampler.reset(common_sampler_clone(slot.smpl.get()));
+        }
+
+        // the pre-park output rides along on the deferred task and is restored
+        // on the resume, so the response covers it exactly like a seamless run
+        auto & pre = task.park_output;
+
+        pre.n_gen                 = slot.task->park_output.n_gen + (int32_t) slot.stats.n_gen;
+        pre.generated             = std::move(slot.generated);
+        pre.generated_tokens      = std::move(slot.generated_tokens);
+        pre.generated_token_probs = std::move(slot.generated_token_probs);
+        pre.n_sent_text           = slot.n_sent_text;
+        pre.last_nl_pos           = slot.last_nl_pos;
+        pre.has_new_line          = slot.has_new_line;
+        pre.truncated             = slot.truncated;
+
+        // the client-facing values are captured once, at the first park:
+        // later parks see the task's internal, park-extended values instead
+        if (slot.task->park_output.has_been_parked) {
+            pre.n_prompt_orig        = slot.task->park_output.n_prompt_orig;
+            pre.n_prompt_cached_orig = slot.task->park_output.n_prompt_cached_orig;
+            pre.n_predict_orig       = slot.task->park_output.n_predict_orig;
+        } else {
+            pre.n_prompt_orig        = slot.task->n_tokens();
+            pre.n_prompt_cached_orig = slot.stats.n_prompt_cached;
+            pre.n_predict_orig       = slot.task->params.n_predict;
+        }
+        pre.has_been_parked = true;
+
+        // the reported metadata covers the whole session: each park adds this
+        // segment's prompt and generation windows (the park wait included).
+        // a resumed segment whose only prompt work was its handed tail adds
+        // no prompt window: the tail is re-evaluated park machinery, not
+        // client-caused prefill, so it is kept out of prompt_ms the same way
+        // n_prompt_tail keeps it out of prompt_n
+        pre.n_prompt_processed = slot.task->park_output.n_prompt_processed + slot.stats.n_prompt_processed;
+        pre.n_prompt_tail      = slot.task->park_output.n_prompt_tail;
+        pre.t_prompt_us        = slot.task->park_output.t_prompt_us
+            + (slot.task->park_output.has_been_parked && slot.stats.n_prompt_processed == 1
+                ? 0 : (slot.stats.t_prompt_last - slot.stats.t_start));
+        pre.t_gen_last         = slot.stats.t_gen_last;
+        pre.t_gen_us           = slot.task->park_output.t_gen_us
+            + (slot.task->park_output.t_gen_last > 0
+                ? slot.stats.t_start - slot.task->park_output.t_gen_last : 0)
+            + slot.stats.t_gen_us();
+        pre.n_draft_tokens      = slot.task->park_output.n_draft_tokens + slot.stats.n_draft_tokens;
+        pre.n_draft_accepted    = slot.task->park_output.n_draft_accepted + slot.stats.n_draft_accepted;
+        pre.n_draft_verif_steps = slot.task->park_output.n_draft_verif_steps + slot.stats.n_draft_verif_steps;
+
+        task.tokens = slot.prompt.tokens.clone();
+
+        // the tail's leading token was already sent - keep it as context so the
+        // resume does not generate it again; the pending draft stays dropped.
+        // the resume re-evaluates this one token as fresh prompt work; it is
+        // counted in n_prompt_tail so the carry fold can keep it out of the
+        // client-visible prompt_n (the tail is park machinery, not work the
+        // client caused)
+        if (n_tail > slot.spec_draft.size()) {
+            task.tokens.push_back(tail[0]);
+            pre.n_prompt_tail += 1;
+        }
+
+        // the task must not requeue until the pool has reserve room for its
+        // restored state
+        parked_task_ids.insert(task.id);
+
+        queue_tasks.defer(std::move(task));
+
+        prune_batch_after_park(batch, slot, off);
+
+        slot.release();
+
+        // the state is saved (or already cached) - return the cells to the
+        // pool now, like the launch path does for idle slots
+        slot.prompt_clear();
+
+        SLT_DBG(slot, "%s", "__TEST_TAG_DECODE_OVERFLOW_PARK__\n");
+
+        return true;
+    }
+
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off) {
@@ -4697,10 +5130,24 @@ private:
         });
 
         if (ret != 0) {
+            // with a policy set, park a session to free its cells and retry
+            // the same chunk with the remaining ones
+            if (ret == 1 && params_base.kv_unified &&
+                    params_base.decode_overflow_policy != COMMON_DECODE_OVERFLOW_POLICY_OFF) {
+                server_slot * victim = get_overflow_victim();
+                if (victim && park_on_overflow(*victim, batch, off)) {
+                    return false;
+                }
+            }
+
             {
                 std::string err;
 
                 if (n_batch == 1 && ret == 1) {
+                    // no session could be parked to free its cells (with the
+                    // carried sampler every processing session is eligible,
+                    // so this is a lone session or an all-ineligible pool),
+                    // and the smallest chunk still does not fit
                     // TODO: try to terminate only the largest active slot/sequence and continue with the rest
                     //       need to remove the tokens from the current batch too
                     err = "Context size has been exceeded.";
